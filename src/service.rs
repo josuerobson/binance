@@ -56,6 +56,7 @@ fn json_err(status: &str, body: &str) -> String {
 pub async fn run_health_server(
     state: Arc<RwLock<GlobalState>>,
     config: Arc<AppConfig>,
+    client: Arc<BinanceClient>,
 ) -> AppResult<()> {
     let port = config.server.health_port;
     let listener = TcpListener::bind(("0.0.0.0", port))
@@ -69,6 +70,7 @@ pub async fn run_health_server(
         })?;
         let state = Arc::clone(&state);
         let config = Arc::clone(&config);
+        let client = Arc::clone(&client);
         tokio::spawn(async move {
             let mut buf = [0_u8; 4096];
             let Ok(n) = socket.read(&mut buf).await else {
@@ -80,7 +82,7 @@ pub async fn run_health_server(
             // Protected routes require X-Api-Key
             let needs_auth = matches!(
                 path.as_str(),
-                "/api/snapshot" | "/api/signals" | "/api/config"
+                "/api/snapshot" | "/api/signals" | "/api/config" | "/api/latency"
             );
             if needs_auth && !auth_ok(&req, &config.dashboard_api_key) {
                 let resp = json_err("401 Unauthorized", r#"{"error":"Unauthorized"}"#);
@@ -202,6 +204,29 @@ pub async fn run_health_server(
                     })
                     .to_string();
                     json_200(body)
+                }
+
+                "/api/latency" => {
+                    let t_before = now_ms();
+                    match client.get_server_time().await {
+                        Ok(binance_time) => {
+                            let t_after = now_ms();
+                            let rtt_ms = t_after - t_before;
+                            let clock_diff_ms = binance_time - (t_before + rtt_ms / 2);
+                            let body = serde_json::json!({
+                                "rtt_ms": rtt_ms,
+                                "binance_server_time_ms": binance_time,
+                                "local_time_ms": t_after,
+                                "clock_diff_ms": clock_diff_ms,
+                            })
+                            .to_string();
+                            json_200(body)
+                        }
+                        Err(e) => {
+                            let msg = e.to_string();
+                            json_err("502 Bad Gateway", &format!(r#"{{"error":{}}}"#, serde_json::json!(msg)))
+                        }
+                    }
                 }
 
                 _ => json_err("404 Not Found", r#"{"error":"not found"}"#),

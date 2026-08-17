@@ -129,9 +129,10 @@ async fn run() -> AppResult<()> {
     {
         let state_for_health = Arc::clone(&state);
         let config_for_health = Arc::new(config.clone());
-        tasks.spawn(
-            async move { run_health_server(state_for_health, config_for_health).await },
-        );
+        let client_for_health = Arc::clone(&client);
+        tasks.spawn(async move {
+            run_health_server(state_for_health, config_for_health, client_for_health).await
+        });
     }
     {
         let client_for_refresh = Arc::clone(&client);
