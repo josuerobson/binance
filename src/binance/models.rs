@@ -174,11 +174,11 @@ impl Serialize for UserDataEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssetBalance {
-    #[serde(rename = "a")]
+    #[serde(rename = "a", alias = "asset")]
     pub asset: String,
-    #[serde(rename = "f")]
+    #[serde(rename = "f", alias = "free")]
     pub free: String,
-    #[serde(rename = "l")]
+    #[serde(rename = "l", alias = "locked")]
     pub locked: String,
 }
 
