@@ -56,9 +56,19 @@ async fn run() -> AppResult<()> {
     }
     reconcile_state(&client, &state).await?;
 
-    let listen_key = client.get_listen_key().await?;
+    // POST /api/v3/userDataStream foi removido do Testnet (HTTP 410).
+    // Quando ausente, o bot continua sem User Data Stream e usa apenas a
+    // reconciliação REST para rastrear posições.
+    let listen_key: Option<String> = match client.get_listen_key().await {
+        Ok(key) => Some(key),
+        Err(AppError::BinanceHttp { status: 410, .. }) => {
+            tracing::warn!("POST /api/v3/userDataStream returned 410 Gone — User Data Stream unavailable; position tracking via REST reconciliation only");
+            None
+        }
+        Err(e) => return Err(e),
+    };
     let symbols = exchange_cache.symbols();
-    tracing::info!(symbols = symbols.len(), "Preflight completed");
+    tracing::info!(symbols = symbols.len(), user_data_stream = listen_key.is_some(), "Preflight completed");
 
     let (market_tx, _) = broadcast::channel(2048);
     let (book_tx, _) = broadcast::channel(4096);
@@ -79,9 +89,9 @@ async fn run() -> AppResult<()> {
         let tx = book_tx.clone();
         tasks.spawn(async move { run_book_ticker_stream(&url, symbols, tx).await });
     }
-    {
+    if let Some(ref key) = listen_key {
         let url = config.ws_user_base_url.clone();
-        let key = listen_key.clone();
+        let key = key.clone();
         let tx = user_tx.clone();
         tasks.spawn(async move { run_user_data_stream(&url, &key, tx).await });
     }
@@ -141,12 +151,12 @@ async fn run() -> AppResult<()> {
             run_reconciliation_loop(client_for_reconciliation, state_for_reconciliation).await
         });
     }
-    {
+    if let Some(key) = listen_key {
         let client_for_keepalive = Arc::clone(&client);
         tasks.spawn(async move {
             run_listen_key_keepalive(
                 client_for_keepalive,
-                listen_key,
+                key,
                 config.exchange.listen_key_refresh_secs,
             )
             .await
