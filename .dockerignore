@@ -1,0 +1,10 @@
+.git
+.gitignore
+.env
+.env.*
+target
+*.log
+PHASE_*_REVIEW.md
+README.md
+SECURITY.md
+docs

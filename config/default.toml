@@ -1,0 +1,25 @@
+[risk]
+max_positions = 2
+position_size_pct = 10.0
+stop_loss_pct = 1.5
+take_profit_1_pct = 3.0
+take_profit_2_pct = 6.0
+min_24h_volume_usdt = 5000000.0
+
+[scanner]
+momentum_window_secs = 60
+momentum_trigger_pct = 2.5
+volume_surge_multiplier = 2.0
+max_spread_pct = 0.3
+buffer_capacity = 1000
+min_ticks = 10
+
+[exchange]
+recv_window_ms = 5000
+exchange_info_refresh_secs = 3600
+listen_key_refresh_secs = 1800
+rest_timeout_secs = 5
+request_weight_limit_per_minute = 6000
+
+[server]
+health_port = 8080
