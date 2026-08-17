@@ -56,6 +56,7 @@ pub struct ServerConfig {
 pub struct AppConfig {
     pub api_key: String,
     pub secret_key: String,
+    pub dashboard_api_key: String,
     pub use_testnet: bool,
     pub dry_run: bool,
     pub allow_live_trading: bool,
@@ -82,6 +83,7 @@ impl AppConfig {
 
         let api_key = required_env("BINANCE_API_KEY")?;
         let secret_key = required_env("BINANCE_SECRET_KEY")?;
+        let dashboard_api_key = env::var("DASHBOARD_API_KEY").unwrap_or_default();
         let use_testnet = parse_bool_env("USE_TESTNET", true)?;
         let dry_run = parse_bool_env("DRY_RUN", true)?;
         let allow_live_trading = parse_bool_env("ALLOW_LIVE_TRADING", false)?;
@@ -123,6 +125,7 @@ impl AppConfig {
         let config = Self {
             api_key,
             secret_key,
+            dashboard_api_key,
             use_testnet,
             dry_run,
             allow_live_trading,
@@ -295,6 +298,7 @@ mod tests {
                 request_weight_limit_per_minute: 6000,
             },
             server: ServerConfig { health_port: 8080 },
+            dashboard_api_key: "test-key".into(),
         }
     }
 

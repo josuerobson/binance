@@ -1,55 +1,214 @@
 use crate::binance::client::BinanceClient;
+use crate::config::AppConfig;
 use crate::engine::state::{reconcile_state, GlobalState};
 use crate::error::{AppError, AppResult};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 
-// TODO FASE 2: dashboard web de monitoramento completo (métricas, histórico de trades)
-pub async fn run_health_server(state: Arc<RwLock<GlobalState>>, port: u16) -> AppResult<()> {
+fn extract_path(request: &str) -> &str {
+    request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or("/")
+}
+
+fn extract_api_key(request: &str) -> Option<&str> {
+    for line in request.lines() {
+        if line.len() >= 10 && line[..10].eq_ignore_ascii_case("x-api-key:") {
+            return Some(line[10..].trim());
+        }
+    }
+    None
+}
+
+fn auth_ok(request: &str, expected: &str) -> bool {
+    if expected.is_empty() {
+        return true;
+    }
+    extract_api_key(request).map_or(false, |k| k == expected)
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+fn json_200(body: String) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{body}",
+        len = body.len()
+    )
+}
+
+fn json_err(status: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{body}",
+        len = body.len()
+    )
+}
+
+pub async fn run_health_server(
+    state: Arc<RwLock<GlobalState>>,
+    config: Arc<AppConfig>,
+) -> AppResult<()> {
+    let port = config.server.health_port;
     let listener = TcpListener::bind(("0.0.0.0", port))
         .await
-        .map_err(|error| AppError::Other(anyhow::anyhow!("health server bind failed: {error}")))?;
+        .map_err(|e| AppError::Other(anyhow::anyhow!("health server bind failed: {e}")))?;
     tracing::info!(port, "Health server listening");
+
     loop {
-        let (mut socket, peer) = listener.accept().await.map_err(|error| {
-            AppError::Other(anyhow::anyhow!("health server accept failed: {error}"))
+        let (mut socket, peer) = listener.accept().await.map_err(|e| {
+            AppError::Other(anyhow::anyhow!("health server accept failed: {e}"))
         })?;
         let state = Arc::clone(&state);
+        let config = Arc::clone(&config);
         tokio::spawn(async move {
-            let mut request = [0_u8; 1024];
-            let read_result = socket.read(&mut request).await;
-            if let Ok(bytes_read) = read_result {
-                let request_line = String::from_utf8_lossy(&request[..bytes_read]);
-                let (status, body) = if request_line.starts_with("GET /health ") {
-                    let state_guard = state.read().await;
-                    let healthy = !state_guard.reconciliation_required;
-                    let status = if healthy {
-                        "200 OK"
-                    } else {
-                        "503 Service Unavailable"
-                    };
+            let mut buf = [0_u8; 4096];
+            let Ok(n) = socket.read(&mut buf).await else {
+                return;
+            };
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let path = extract_path(&req).to_owned();
+
+            // Protected routes require X-Api-Key
+            let needs_auth = matches!(
+                path.as_str(),
+                "/api/snapshot" | "/api/signals" | "/api/config"
+            );
+            if needs_auth && !auth_ok(&req, &config.dashboard_api_key) {
+                let resp = json_err("401 Unauthorized", r#"{"error":"Unauthorized"}"#);
+                if let Err(e) = socket.write_all(resp.as_bytes()).await {
+                    tracing::warn!(?peer, error=%e, "Response write failed");
+                }
+                return;
+            }
+
+            let response = match path.as_str() {
+                "/health" => {
+                    let g = state.read().await;
+                    let ok = !g.reconciliation_required;
                     let body = serde_json::json!({
-                        "status": if healthy { "ok" } else { "reconciling" },
-                        "reconciliation_required": state_guard.reconciliation_required,
-                        "open_positions": state_guard.open_positions.len(),
-                        "blocked_symbols": state_guard.blocked_symbols.len(),
-                        "cached_symbols": state_guard.exchange_info.len(),
+                        "status": if ok { "ok" } else { "reconciling" },
+                        "reconciliation_required": g.reconciliation_required,
+                        "open_positions": g.open_positions.len(),
+                        "blocked_symbols": g.blocked_symbols.len(),
+                        "cached_symbols": g.exchange_info.len(),
                     })
                     .to_string();
-                    (status, body)
-                } else {
-                    ("404 Not Found", "not found".to_owned())
-                };
-                let response = format!(
-                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                if let Err(error) = socket.write_all(response.as_bytes()).await {
-                    tracing::warn!(?peer, error = %error, "Health response write failed");
+                    let st = if ok { "200 OK" } else { "503 Service Unavailable" };
+                    format!(
+                        "HTTP/1.1 {st}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{body}",
+                        len = body.len()
+                    )
                 }
+
+                "/api/snapshot" => {
+                    let g = state.read().await;
+                    let ok = !g.reconciliation_required;
+                    let usdt_locked = g
+                        .balances
+                        .get("USDT")
+                        .and_then(|b| b.locked.parse::<f64>().ok())
+                        .filter(|v| v.is_finite() && *v >= 0.0)
+                        .unwrap_or(0.0);
+                    let positions: Vec<_> = g
+                        .open_positions
+                        .values()
+                        .map(|p| {
+                            serde_json::json!({
+                                "symbol": p.symbol,
+                                "entry_price": p.entry_price,
+                                "quantity": p.quantity,
+                                "current_price": serde_json::Value::Null,
+                                "pnl_pct": serde_json::Value::Null,
+                                "pnl_usdt": serde_json::Value::Null,
+                                "entry_order_id": p.entry_order_id,
+                                "order_list_id": p.order_list_id,
+                                "opened_at": p.opened_at,
+                            })
+                        })
+                        .collect();
+                    let pending: Vec<&String> = g.pending_symbols.iter().collect();
+                    let blocked: Vec<&String> = g.blocked_symbols.iter().collect();
+                    let body = serde_json::json!({
+                        "timestamp_ms": now_ms(),
+                        "balance": {
+                            "usdt_free": g.usdt_balance,
+                            "usdt_locked": usdt_locked,
+                        },
+                        "positions": positions,
+                        "symbols": {
+                            "pending": pending,
+                            "blocked": blocked,
+                            "cached_count": g.exchange_info.len(),
+                        },
+                        "health": {
+                            "status": if ok { "ok" } else { "reconciling" },
+                            "reconciliation_required": g.reconciliation_required,
+                            "open_positions": g.open_positions.len(),
+                            "blocked_symbols": g.blocked_symbols.len(),
+                            "cached_symbols": g.exchange_info.len(),
+                        },
+                        "request_weight": {
+                            "used_weight": 0,
+                            "limit": config.exchange.request_weight_limit_per_minute,
+                            "window_seconds_remaining": 60,
+                        },
+                        "mode": {
+                            "use_testnet": config.use_testnet,
+                            "dry_run": config.dry_run,
+                        },
+                    })
+                    .to_string();
+                    json_200(body)
+                }
+
+                "/api/signals" => {
+                    let g = state.read().await;
+                    let signals: Vec<_> = g.recent_signals.iter().rev().cloned().collect();
+                    let count = signals.len();
+                    let body = serde_json::json!({ "count": count, "signals": signals }).to_string();
+                    json_200(body)
+                }
+
+                "/api/config" => {
+                    let body = serde_json::json!({
+                        "mode": {
+                            "use_testnet": config.use_testnet,
+                            "dry_run": config.dry_run,
+                            "allow_live_trading": config.allow_live_trading,
+                        },
+                        "scanner": {
+                            "momentum_trigger_pct": config.scanner.momentum_trigger_pct,
+                            "momentum_window_secs": config.scanner.momentum_window_secs,
+                            "volume_surge_multiplier": config.scanner.volume_surge_multiplier,
+                            "max_spread_pct": config.scanner.max_spread_pct,
+                        },
+                        "risk": {
+                            "stop_loss_pct": config.risk.stop_loss_pct,
+                            "take_profit_1_pct": config.risk.take_profit_1_pct,
+                            "take_profit_2_pct": config.risk.take_profit_2_pct,
+                            "max_positions": config.risk.max_positions,
+                            "position_size_pct": config.risk.position_size_pct,
+                            "min_24h_volume_usdt": config.risk.min_24h_volume_usdt,
+                        },
+                    })
+                    .to_string();
+                    json_200(body)
+                }
+
+                _ => json_err("404 Not Found", r#"{"error":"not found"}"#),
+            };
+
+            if let Err(e) = socket.write_all(response.as_bytes()).await {
+                tracing::warn!(?peer, error=%e, "Response write failed");
             }
         });
     }

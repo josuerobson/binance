@@ -1,7 +1,20 @@
 use crate::binance::exchange_info::ExchangeInfoCache;
 use crate::binance::models::{AccountInfo, AssetBalance};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+
+const SIGNAL_BUFFER_CAPACITY: usize = 200;
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SignalRecord {
+    pub symbol: String,
+    pub current_price: f64,
+    pub pct_change: f64,
+    pub volume_surge: f64,
+    pub bid: f64,
+    pub ask: f64,
+    pub detected_at: i64,
+}
 
 #[derive(Debug, Clone)]
 pub struct Position {
@@ -24,6 +37,7 @@ pub struct GlobalState {
     pub balances: HashMap<String, AssetBalance>,
     pub usdt_balance: f64,
     pub exchange_info: Arc<ExchangeInfoCache>,
+    pub recent_signals: VecDeque<SignalRecord>,
 }
 
 impl GlobalState {
@@ -47,6 +61,7 @@ impl GlobalState {
             balances,
             usdt_balance,
             exchange_info: Arc::new(ExchangeInfoCache::new()),
+            recent_signals: VecDeque::with_capacity(SIGNAL_BUFFER_CAPACITY),
         }
     }
 
@@ -59,7 +74,15 @@ impl GlobalState {
             balances: HashMap::new(),
             usdt_balance,
             exchange_info: Arc::new(ExchangeInfoCache::new()),
+            recent_signals: VecDeque::with_capacity(SIGNAL_BUFFER_CAPACITY),
         }
+    }
+
+    pub fn push_signal(&mut self, signal: SignalRecord) {
+        if self.recent_signals.len() >= SIGNAL_BUFFER_CAPACITY {
+            self.recent_signals.pop_front();
+        }
+        self.recent_signals.push_back(signal);
     }
 
     pub fn open_positions_count(&self) -> usize {

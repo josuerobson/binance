@@ -194,6 +194,18 @@ pub async fn run_scanner(
                         };
                         for signal in signals {
                             tracing::info!(symbol = %signal.symbol, price = %signal.current_price, momentum_pct = %signal.pct_change, volume_surge = %signal.volume_surge, "Momentum signal detected");
+                            {
+                                let mut st = state.write().await;
+                                st.push_signal(crate::engine::state::SignalRecord {
+                                    symbol: signal.symbol.clone(),
+                                    current_price: signal.current_price,
+                                    pct_change: signal.pct_change,
+                                    volume_surge: signal.volume_surge,
+                                    bid: signal.bid,
+                                    ask: signal.ask,
+                                    detected_at: signal.detected_at,
+                                });
+                            }
                             signal_tx.send(signal).await.map_err(|_| AppError::ChannelClosed("signal channel".to_owned()))?;
                         }
                     }
