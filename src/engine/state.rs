@@ -1,6 +1,6 @@
 use crate::binance::exchange_info::ExchangeInfoCache;
 use crate::binance::models::{AccountInfo, AssetBalance};
-use crate::engine::paper::{PaperPosition, PaperTrade};
+use crate::engine::paper::{PaperPosition, PaperTrade, ScannerCandidate};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
@@ -43,6 +43,7 @@ pub struct GlobalState {
     pub paper_positions: HashMap<String, PaperPosition>,
     pub paper_history: VecDeque<PaperTrade>,
     pub paper_balance: f64,
+    pub scanner_candidates: Vec<ScannerCandidate>,
 }
 
 impl GlobalState {
@@ -70,6 +71,7 @@ impl GlobalState {
             paper_positions: HashMap::new(),
             paper_history: VecDeque::with_capacity(PAPER_HISTORY_CAPACITY),
             paper_balance: 10_000.0,
+            scanner_candidates: Vec::new(),
         }
     }
 
@@ -86,6 +88,7 @@ impl GlobalState {
             paper_positions: HashMap::new(),
             paper_history: VecDeque::with_capacity(PAPER_HISTORY_CAPACITY),
             paper_balance: 10_000.0,
+            scanner_candidates: Vec::new(),
         }
     }
 
@@ -218,6 +221,10 @@ impl GlobalState {
         if balance.is_finite() && balance >= 0.0 {
             self.paper_balance = balance;
         }
+    }
+
+    pub fn set_scanner_candidates(&mut self, candidates: Vec<ScannerCandidate>) {
+        self.scanner_candidates = candidates;
     }
 }
 

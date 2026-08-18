@@ -59,6 +59,21 @@ pub struct RuntimeConfig {
     pub paper_balance: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScannerCandidate {
+    pub symbol: String,
+    pub price: f64,
+    pub momentum_pct: f64,
+    pub momentum_target_pct: f64,
+    pub volume_surge: f64,
+    pub volume_surge_target: f64,
+    pub volume_24h: f64,
+    pub spread_pct: f64,
+    pub tick_count: usize,
+    pub proximity_score: f64,
+    pub updated_at: i64,
+}
+
 impl RuntimeConfig {
     pub fn from_app_config(config: &AppConfig) -> Self {
         Self {

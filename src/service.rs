@@ -100,6 +100,7 @@ pub async fn run_health_server(
                     | "/api/paper/positions"
                     | "/api/paper/history"
                     | "/api/runtime/config"
+                    | "/api/scanner/candidates"
             );
             if needs_auth && !auth_ok(&req, &config.dashboard_api_key) {
                 let resp = json_err("401 Unauthorized", r#"{"error":"Unauthorized"}"#);
@@ -309,6 +310,16 @@ pub async fn run_health_server(
                         }
                         _ => json_err("405 Method Not Allowed", r#"{"error":"method not allowed"}"#),
                     }
+                }
+
+                "/api/scanner/candidates" => {
+                    let g = state.read().await;
+                    let body = serde_json::json!({
+                        "count": g.scanner_candidates.len(),
+                        "candidates": g.scanner_candidates,
+                    })
+                    .to_string();
+                    json_200(body)
                 }
 
                 _ => json_err("404 Not Found", r#"{"error":"not found"}"#),

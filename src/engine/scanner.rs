@@ -1,6 +1,6 @@
 use crate::binance::models::{BookTickerEvent, MiniTickerEvent};
 use crate::config::ScannerConfig;
-use crate::engine::paper::{now_ms, RuntimeConfig};
+use crate::engine::paper::{now_ms, RuntimeConfig, ScannerCandidate};
 use crate::engine::state::GlobalState;
 use crate::error::{AppError, AppResult};
 use std::collections::{HashMap, VecDeque};
@@ -161,6 +161,54 @@ impl Scanner {
         })
     }
 
+    pub fn collect_candidates(&self, runtime: &RuntimeConfig, state: &GlobalState) -> Vec<ScannerCandidate> {
+        let now = now_ms();
+        let cutoff = now.saturating_sub((runtime.momentum_window_secs.saturating_mul(1000)) as i64);
+        let mut candidates: Vec<ScannerCandidate> = self
+            .buffers
+            .iter()
+            .filter(|(sym, _)| is_eligible_symbol(sym) && !state.has_symbol(sym))
+            .filter_map(|(symbol, buffer)| {
+                if buffer.len() < 5 {
+                    return None;
+                }
+                let last = buffer.back()?;
+                let window: Vec<_> = buffer.iter().filter(|t| t.timestamp_ms >= cutoff).collect();
+                if window.len() < 3 {
+                    return None;
+                }
+                let first_in_window = window.first()?;
+                let pct_change = (last.price - first_in_window.price) / first_in_window.price * 100.0;
+                if !pct_change.is_finite() || pct_change <= 0.0 {
+                    return None;
+                }
+                let volume_sum: f64 = window.iter().map(|t| t.volume).sum();
+                let avg_volume = volume_sum / window.len() as f64;
+                let volume_surge = if avg_volume > f64::EPSILON { last.volume / avg_volume } else { 0.0 };
+                let spread_pct = if last.bid > 0.0 { (last.ask - last.bid) / last.bid * 100.0 } else { f64::MAX };
+                let mom_ratio = (pct_change / runtime.momentum_trigger_pct).max(0.0).min(1.5);
+                let vol_ratio = (volume_surge / runtime.volume_surge_multiplier).max(0.0).min(1.5);
+                let proximity_score = (mom_ratio + vol_ratio) / 2.0;
+                Some(ScannerCandidate {
+                    symbol: symbol.clone(),
+                    price: last.price,
+                    momentum_pct: pct_change,
+                    momentum_target_pct: runtime.momentum_trigger_pct,
+                    volume_surge,
+                    volume_surge_target: runtime.volume_surge_multiplier,
+                    volume_24h: last.volume_24h,
+                    spread_pct,
+                    tick_count: buffer.len(),
+                    proximity_score,
+                    updated_at: last.timestamp_ms,
+                })
+            })
+            .collect();
+        candidates.sort_by(|a, b| b.proximity_score.partial_cmp(&a.proximity_score).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.truncate(30);
+        candidates
+    }
+
     pub fn process_market_batch(
         &mut self,
         events: &[MiniTickerEvent],
@@ -218,6 +266,7 @@ pub async fn run_scanner(
     state: Arc<RwLock<GlobalState>>,
 ) -> AppResult<()> {
     let mut scanner = Scanner::new();
+    let mut last_candidates_update: i64 = 0;
     loop {
         tokio::select! {
             market = market_rx.recv() => {
@@ -244,6 +293,16 @@ pub async fn run_scanner(
                                     "Paper position closed"
                                 );
                             }
+                        }
+                        // Update scanner candidates every 3 seconds
+                        let now = now_ms();
+                        if now - last_candidates_update >= 3_000 {
+                            last_candidates_update = now;
+                            let candidates = {
+                                let state_guard = state.read().await;
+                                scanner.collect_candidates(&rt, &state_guard)
+                            };
+                            state.write().await.set_scanner_candidates(candidates);
                         }
                         for signal in signals {
                             tracing::info!(symbol = %signal.symbol, price = %signal.current_price, momentum_pct = %signal.pct_change, volume_surge = %signal.volume_surge, "Momentum signal detected");
