@@ -44,6 +44,8 @@ pub struct GlobalState {
     pub paper_history: VecDeque<PaperTrade>,
     pub paper_balance: f64,
     pub scanner_candidates: Vec<ScannerCandidate>,
+    pub btc_momentum_pct: Option<f64>,
+    pub btc_filter_ok: bool,
 }
 
 impl GlobalState {
@@ -72,6 +74,8 @@ impl GlobalState {
             paper_history: VecDeque::with_capacity(PAPER_HISTORY_CAPACITY),
             paper_balance: 10_000.0,
             scanner_candidates: Vec::new(),
+            btc_momentum_pct: None,
+            btc_filter_ok: true,
         }
     }
 
@@ -89,6 +93,8 @@ impl GlobalState {
             paper_history: VecDeque::with_capacity(PAPER_HISTORY_CAPACITY),
             paper_balance: 10_000.0,
             scanner_candidates: Vec::new(),
+            btc_momentum_pct: None,
+            btc_filter_ok: true,
         }
     }
 
@@ -225,6 +231,22 @@ impl GlobalState {
 
     pub fn set_scanner_candidates(&mut self, candidates: Vec<ScannerCandidate>) {
         self.scanner_candidates = candidates;
+    }
+
+    pub fn update_paper_position_trailing(&mut self, symbol: &str, new_stop: f64, new_highest: f64) {
+        if let Some(pos) = self.paper_positions.get_mut(symbol) {
+            if new_stop > pos.stop_price {
+                pos.stop_price = new_stop;
+            }
+            if new_highest > pos.highest_price_seen {
+                pos.highest_price_seen = new_highest;
+            }
+        }
+    }
+
+    pub fn set_btc_status(&mut self, momentum_pct: Option<f64>, filter_ok: bool) {
+        self.btc_momentum_pct = momentum_pct;
+        self.btc_filter_ok = filter_ok;
     }
 }
 

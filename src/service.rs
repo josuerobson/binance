@@ -314,9 +314,15 @@ pub async fn run_health_server(
 
                 "/api/scanner/candidates" => {
                     let g = state.read().await;
+                    let rt = runtime.read().await;
                     let body = serde_json::json!({
                         "count": g.scanner_candidates.len(),
                         "candidates": g.scanner_candidates,
+                        "btc_momentum_pct": g.btc_momentum_pct,
+                        "btc_filter_ok": g.btc_filter_ok,
+                        "btc_filter_enabled": rt.btc_filter_enabled,
+                        "btc_filter_window_secs": rt.btc_filter_window_secs,
+                        "btc_min_momentum_pct": rt.btc_min_momentum_pct,
                     })
                     .to_string();
                     json_200(body)

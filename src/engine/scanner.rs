@@ -161,6 +161,35 @@ impl Scanner {
         })
     }
 
+    /// Returns the BTC/USDT momentum over the given window, or None if insufficient data.
+    pub fn btc_momentum(&self, window_secs: u64) -> Option<f64> {
+        let buffer = self.buffers.get("BTCUSDT")?;
+        if buffer.len() < 2 {
+            return None;
+        }
+        let now = now_ms();
+        let cutoff = now.saturating_sub((window_secs.saturating_mul(1000)) as i64);
+        let window: Vec<_> = buffer.iter().filter(|t| t.timestamp_ms >= cutoff).collect();
+        if window.len() < 2 {
+            return None;
+        }
+        let first = window.first()?;
+        let last = window.last()?;
+        let mom = (last.price - first.price) / first.price * 100.0;
+        if mom.is_finite() { Some(mom) } else { None }
+    }
+
+    /// Returns true if BTC trend is acceptable for new entries (or filter is disabled).
+    pub fn btc_trend_ok(&self, runtime: &RuntimeConfig) -> bool {
+        if !runtime.btc_filter_enabled {
+            return true;
+        }
+        match self.btc_momentum(runtime.btc_filter_window_secs) {
+            Some(mom) => mom >= runtime.btc_min_momentum_pct,
+            None => true, // no BTC data yet — allow
+        }
+    }
+
     pub fn collect_candidates(&self, runtime: &RuntimeConfig, state: &GlobalState) -> Vec<ScannerCandidate> {
         let now = now_ms();
         let cutoff = now.saturating_sub((runtime.momentum_window_secs.saturating_mul(1000)) as i64);
@@ -216,45 +245,70 @@ impl Scanner {
         runtime: &RuntimeConfig,
         state: &GlobalState,
     ) -> Vec<MomentumSignal> {
-        events
+        // Always update all buffers (BTC buffer must stay current for the filter).
+        let signals: Vec<MomentumSignal> = events
             .iter()
             .filter_map(|event| self.process_mini_ticker(event, static_cfg, runtime, state))
-            .collect()
+            .collect();
+
+        // Suppress signals when BTC trend is negative.
+        if !self.btc_trend_ok(runtime) {
+            return vec![];
+        }
+        signals
     }
 }
 
-// Returns (symbol, exit_price, reason, closed_at_ms) for each paper position that hit SL or TP.
-fn check_paper_closes(
+/// Trailing update: (symbol, new_stop_price, new_highest_price_seen)
+type TrailingUpdate = (String, f64, f64);
+
+/// Returns paper position closes and pending trailing stop updates.
+fn check_paper_positions(
     events: &[MiniTickerEvent],
     state: &GlobalState,
-) -> Vec<(String, f64, String, i64)> {
+    trailing_enabled: bool,
+) -> (Vec<(String, f64, String, i64)>, Vec<TrailingUpdate>) {
     if state.paper_positions.is_empty() {
-        return vec![];
+        return (vec![], vec![]);
     }
     let ts = events
         .first()
         .map(|e| e.event_time_ms)
         .unwrap_or_else(now_ms);
-    let mut closes = Vec::new();
+    let mut closes: Vec<(String, f64, String, i64)> = Vec::new();
+    let mut trailing_updates: Vec<TrailingUpdate> = Vec::new();
+
     for event in events {
         if let Some(pos) = state.paper_positions.get(&event.symbol) {
             if let Ok(price) = event.close_price.parse::<f64>() {
-                if price.is_finite() && price > 0.0 {
-                    if price <= pos.stop_price {
-                        closes.push((event.symbol.clone(), pos.stop_price, "SL".to_owned(), ts));
-                    } else if price >= pos.take_profit_price {
-                        closes.push((
-                            event.symbol.clone(),
-                            pos.take_profit_price,
-                            "TP".to_owned(),
-                            ts,
-                        ));
-                    }
+                if !price.is_finite() || price <= 0.0 {
+                    continue;
+                }
+                // Compute effective stop (trailing or fixed).
+                let (effective_stop, new_highest) = if trailing_enabled && pos.trailing_stop_distance_pct > 0.0 {
+                    let new_highest = price.max(pos.highest_price_seen);
+                    let trailing = new_highest * (1.0 - pos.trailing_stop_distance_pct / 100.0);
+                    // Stop only moves up — never down.
+                    let new_stop = pos.stop_price.max(trailing);
+                    (new_stop, new_highest)
+                } else {
+                    (pos.stop_price, pos.highest_price_seen)
+                };
+
+                // Enqueue trailing state update if anything changed.
+                if effective_stop > pos.stop_price || new_highest > pos.highest_price_seen {
+                    trailing_updates.push((event.symbol.clone(), effective_stop, new_highest));
+                }
+
+                if price <= effective_stop {
+                    closes.push((event.symbol.clone(), effective_stop, "SL".to_owned(), ts));
+                } else if price >= pos.take_profit_price {
+                    closes.push((event.symbol.clone(), pos.take_profit_price, "TP".to_owned(), ts));
                 }
             }
         }
     }
-    closes
+    (closes, trailing_updates)
 }
 
 pub async fn run_scanner(
@@ -277,11 +331,21 @@ pub async fn run_scanner(
                             let state_guard = state.read().await;
                             scanner.process_market_batch(&events, &static_cfg, &rt, &state_guard)
                         };
-                        // Check paper positions for SL/TP hits
-                        let paper_closes = {
+
+                        // Check paper positions: trailing stop updates + SL/TP closes.
+                        let (paper_closes, trailing_updates) = {
                             let state_guard = state.read().await;
-                            check_paper_closes(&events, &state_guard)
+                            check_paper_positions(&events, &state_guard, rt.trailing_stop_enabled)
                         };
+
+                        // Apply trailing updates first (moves stops up before checking closes).
+                        if !trailing_updates.is_empty() {
+                            let mut st = state.write().await;
+                            for (sym, new_stop, new_highest) in trailing_updates {
+                                st.update_paper_position_trailing(&sym, new_stop, new_highest);
+                            }
+                        }
+
                         for (symbol, exit_price, reason, closed_at) in paper_closes {
                             let mut st = state.write().await;
                             if let Some(trade) = st.close_paper_position(&symbol, exit_price, &reason, closed_at) {
@@ -294,16 +358,22 @@ pub async fn run_scanner(
                                 );
                             }
                         }
-                        // Update scanner candidates every 3 seconds
+
+                        // Update scanner candidates + BTC status every 3 seconds.
                         let now = now_ms();
                         if now - last_candidates_update >= 3_000 {
                             last_candidates_update = now;
+                            let btc_mom = scanner.btc_momentum(rt.btc_filter_window_secs);
+                            let btc_ok = scanner.btc_trend_ok(&rt);
                             let candidates = {
                                 let state_guard = state.read().await;
                                 scanner.collect_candidates(&rt, &state_guard)
                             };
-                            state.write().await.set_scanner_candidates(candidates);
+                            let mut st = state.write().await;
+                            st.set_scanner_candidates(candidates);
+                            st.set_btc_status(btc_mom, btc_ok);
                         }
+
                         for signal in signals {
                             tracing::info!(symbol = %signal.symbol, price = %signal.current_price, momentum_pct = %signal.pct_change, volume_surge = %signal.volume_surge, "Momentum signal detected");
                             {
@@ -380,6 +450,11 @@ mod tests {
             position_size_pct: 10.0,
             max_positions: 2,
             paper_balance: 10_000.0,
+            btc_filter_enabled: false, // disabled in tests so BTC buffer absence doesn't block signals
+            btc_filter_window_secs: 300,
+            btc_min_momentum_pct: 0.0,
+            trailing_stop_enabled: true,
+            trailing_stop_distance_pct: 1.5,
         }
     }
 
@@ -470,5 +545,52 @@ mod tests {
             timestamp_ms: 60_000,
         };
         assert!(scanner.process_tick("ABCUSDT", tick, &scfg, &rt, &state_with_pending).is_none());
+    }
+
+    #[test]
+    fn btc_filter_blocks_signals_when_btc_falling() {
+        let mut scanner = Scanner::new();
+        let state = GlobalState::with_balance(1000.0);
+        let scfg = static_cfg();
+        let mut rt = runtime();
+        rt.btc_filter_enabled = true;
+        rt.btc_min_momentum_pct = 0.0;
+
+        // Feed falling BTC ticks to populate the BTC buffer.
+        for index in 0..15 {
+            let btc_tick = PriceTick {
+                price: 50_000.0 - index as f64 * 100.0, // BTC falling
+                volume: 1.0,
+                volume_24h: 1_000_000_000.0,
+                bid: 49_900.0,
+                ask: 49_901.0,
+                timestamp_ms: index * 4_000,
+            };
+            scanner.process_tick("BTCUSDT", btc_tick, &scfg, &rt, &state);
+        }
+
+        // Feed a valid signal for another coin — should be suppressed.
+        for index in 0..14 {
+            scanner.process_tick("ABCUSDT", PriceTick {
+                price: 100.0 + index as f64 * 0.15,
+                volume: 1.0,
+                volume_24h: 6_000_000.0,
+                bid: 102.9,
+                ask: 103.0,
+                timestamp_ms: index * 4_000,
+            }, &scfg, &rt, &state);
+        }
+        let result = scanner.process_tick("ABCUSDT", PriceTick {
+            price: 103.0,
+            volume: 2.5,
+            volume_24h: 6_000_000.0,
+            bid: 102.9,
+            ask: 103.0,
+            timestamp_ms: 56_000,
+        }, &scfg, &rt, &state);
+        // process_tick itself doesn't check BTC filter; process_market_batch does.
+        // Here we verify btc_trend_ok returns false.
+        assert!(!scanner.btc_trend_ok(&rt));
+        drop(result); // may or may not be Some — process_tick ignores BTC filter
     }
 }

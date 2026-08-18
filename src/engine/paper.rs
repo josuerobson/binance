@@ -23,6 +23,8 @@ pub struct PaperPosition {
     pub momentum_trigger_pct: f64,
     pub momentum_window_secs: u64,
     pub volume_surge_multiplier: f64,
+    pub highest_price_seen: f64,
+    pub trailing_stop_distance_pct: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -46,20 +48,6 @@ pub struct PaperTrade {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RuntimeConfig {
-    pub momentum_window_secs: u64,
-    pub momentum_trigger_pct: f64,
-    pub volume_surge_multiplier: f64,
-    pub max_spread_pct: f64,
-    pub min_24h_volume_usdt: f64,
-    pub stop_loss_pct: f64,
-    pub take_profit_pct: f64,
-    pub position_size_pct: f64,
-    pub max_positions: usize,
-    pub paper_balance: f64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScannerCandidate {
     pub symbol: String,
     pub price: f64,
@@ -74,19 +62,53 @@ pub struct ScannerCandidate {
     pub updated_at: i64,
 }
 
+fn default_true() -> bool { true }
+fn default_btc_window() -> u64 { 300 }
+fn default_trailing_distance() -> f64 { 1.5 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeConfig {
+    pub momentum_window_secs: u64,
+    pub momentum_trigger_pct: f64,
+    pub volume_surge_multiplier: f64,
+    pub max_spread_pct: f64,
+    pub min_24h_volume_usdt: f64,
+    pub stop_loss_pct: f64,
+    pub take_profit_pct: f64,
+    pub position_size_pct: f64,
+    pub max_positions: usize,
+    pub paper_balance: f64,
+    #[serde(default = "default_true")]
+    pub btc_filter_enabled: bool,
+    #[serde(default = "default_btc_window")]
+    pub btc_filter_window_secs: u64,
+    #[serde(default)]
+    pub btc_min_momentum_pct: f64,
+    #[serde(default = "default_true")]
+    pub trailing_stop_enabled: bool,
+    #[serde(default = "default_trailing_distance")]
+    pub trailing_stop_distance_pct: f64,
+}
+
 impl RuntimeConfig {
     pub fn from_app_config(config: &AppConfig) -> Self {
+        let sl = config.risk.stop_loss_pct;
         Self {
             momentum_window_secs: config.scanner.momentum_window_secs,
             momentum_trigger_pct: config.scanner.momentum_trigger_pct,
             volume_surge_multiplier: config.scanner.volume_surge_multiplier,
             max_spread_pct: config.scanner.max_spread_pct,
             min_24h_volume_usdt: config.risk.min_24h_volume_usdt,
-            stop_loss_pct: config.risk.stop_loss_pct,
+            stop_loss_pct: sl,
             take_profit_pct: config.risk.take_profit_1_pct,
             position_size_pct: config.risk.position_size_pct,
             max_positions: config.risk.max_positions,
             paper_balance: 10_000.0,
+            btc_filter_enabled: true,
+            btc_filter_window_secs: 300,
+            btc_min_momentum_pct: 0.0,
+            trailing_stop_enabled: true,
+            trailing_stop_distance_pct: sl,
         }
     }
 
@@ -102,5 +124,10 @@ impl RuntimeConfig {
             && self.position_size_pct <= 100.0
             && self.max_positions > 0
             && self.paper_balance >= 0.0
+            && self.btc_filter_window_secs >= 30
+            && self.btc_min_momentum_pct >= -10.0
+            && self.btc_min_momentum_pct <= 10.0
+            && self.trailing_stop_distance_pct >= 0.1
+            && self.trailing_stop_distance_pct <= 50.0
     }
 }

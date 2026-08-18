@@ -251,6 +251,8 @@ async fn open_paper_position(
         momentum_trigger_pct: rt.momentum_trigger_pct,
         momentum_window_secs: rt.momentum_window_secs,
         volume_surge_multiplier: rt.volume_surge_multiplier,
+        highest_price_seen: signal.current_price,
+        trailing_stop_distance_pct: rt.trailing_stop_distance_pct,
     };
     tracing::info!(
         symbol = %signal.symbol,
