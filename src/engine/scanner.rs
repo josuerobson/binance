@@ -2,7 +2,7 @@ use crate::binance::models::{BookTickerEvent, MiniTickerEvent};
 use crate::config::ScannerConfig;
 use crate::engine::arb::{ArbOpportunity, ArbScanner};
 use crate::engine::paper::{now_ms, RuntimeConfig, ScannerCandidate};
-use crate::engine::state::GlobalState;
+use crate::engine::state::{ExperimentSlot, GlobalState};
 use crate::error::{AppError, AppResult};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -283,6 +283,45 @@ impl Scanner {
 /// Trailing update: (symbol, new_stop_price, new_highest_price_seen)
 type TrailingUpdate = (String, f64, f64);
 
+/// Same as check_paper_positions but operates on a single experiment slot.
+fn check_experiment_slot_positions(
+    events: &[MiniTickerEvent],
+    slot: &ExperimentSlot,
+) -> (Vec<(String, f64, String, i64)>, Vec<TrailingUpdate>) {
+    if slot.paper_positions.is_empty() {
+        return (vec![], vec![]);
+    }
+    let ts = events.first().map(|e| e.event_time_ms).unwrap_or_else(now_ms);
+    let mut closes: Vec<(String, f64, String, i64)> = Vec::new();
+    let mut trailing_updates: Vec<TrailingUpdate> = Vec::new();
+    let trailing_enabled = slot.config.trailing_stop_enabled;
+
+    for event in events {
+        if let Some(pos) = slot.paper_positions.get(&event.symbol) {
+            if let Ok(price) = event.close_price.parse::<f64>() {
+                if !price.is_finite() || price <= 0.0 { continue; }
+                let (effective_stop, new_highest) = if trailing_enabled && pos.trailing_stop_distance_pct > 0.0 {
+                    let new_highest = price.max(pos.highest_price_seen);
+                    let trailing = new_highest * (1.0 - pos.trailing_stop_distance_pct / 100.0);
+                    let new_stop = pos.stop_price.max(trailing);
+                    (new_stop, new_highest)
+                } else {
+                    (pos.stop_price, pos.highest_price_seen)
+                };
+                if effective_stop > pos.stop_price || new_highest > pos.highest_price_seen {
+                    trailing_updates.push((event.symbol.clone(), effective_stop, new_highest));
+                }
+                if price <= effective_stop {
+                    closes.push((event.symbol.clone(), effective_stop, "SL".to_owned(), ts));
+                } else if price >= pos.take_profit_price {
+                    closes.push((event.symbol.clone(), pos.take_profit_price, "TP".to_owned(), ts));
+                }
+            }
+        }
+    }
+    (closes, trailing_updates)
+}
+
 /// Returns paper position closes and pending trailing stop updates.
 fn check_paper_positions(
     events: &[MiniTickerEvent],
@@ -377,6 +416,45 @@ pub async fn run_scanner(
                                     reason = %trade.exit_reason,
                                     "Paper position closed"
                                 );
+                            }
+                        }
+
+                        // Check experiment slot positions (SL/TP exits per slot config).
+                        let slot_results: Vec<(usize, Vec<(String, f64, String, i64)>, Vec<TrailingUpdate>)> = {
+                            let state_guard = state.read().await;
+                            if state_guard.experiment_active {
+                                state_guard.experiment_slots.iter().enumerate()
+                                    .map(|(idx, slot)| {
+                                        let (closes, trailing) = check_experiment_slot_positions(&events, slot);
+                                        (idx, closes, trailing)
+                                    })
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            }
+                        };
+                        for (idx, slot_closes, slot_trailing) in slot_results {
+                            if !slot_trailing.is_empty() {
+                                let mut st = state.write().await;
+                                for (sym, new_stop, new_highest) in slot_trailing {
+                                    if let Some(slot) = st.experiment_slots.get_mut(idx) {
+                                        slot.update_trailing(&sym, new_stop, new_highest);
+                                    }
+                                }
+                            }
+                            for (symbol, exit_price, reason, closed_at) in slot_closes {
+                                let mut st = state.write().await;
+                                if let Some(slot) = st.experiment_slots.get_mut(idx) {
+                                    if let Some(trade) = slot.close_position(&symbol, exit_price, &reason, closed_at) {
+                                        tracing::debug!(
+                                            slot_id = idx,
+                                            symbol = %trade.symbol,
+                                            pnl_pct = %trade.pnl_pct,
+                                            reason = %trade.exit_reason,
+                                            "Experiment slot position closed"
+                                        );
+                                    }
+                                }
                             }
                         }
 

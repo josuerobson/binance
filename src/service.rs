@@ -102,6 +102,10 @@ pub async fn run_health_server(
                     | "/api/runtime/config"
                     | "/api/scanner/candidates"
                     | "/api/arb/opportunities"
+                    | "/api/experiment/status"
+                    | "/api/experiment/start"
+                    | "/api/experiment/stop"
+                    | "/api/experiment/reset"
             );
             if needs_auth && !auth_ok(&req, &config.dashboard_api_key) {
                 let resp = json_err("401 Unauthorized", r#"{"error":"Unauthorized"}"#);
@@ -343,6 +347,90 @@ pub async fn run_health_server(
                     })
                     .to_string();
                     json_200(body)
+                }
+
+                "/api/experiment/status" => {
+                    let g = state.read().await;
+                    let slots: Vec<_> = g.experiment_slots.iter().map(|s| {
+                        serde_json::json!({
+                            "id": s.id,
+                            "label": s.label,
+                            "ai_provider": s.ai_provider,
+                            "config": s.config,
+                            "paper_balance": s.paper_balance,
+                            "initial_balance": s.initial_balance,
+                            "open_positions": s.paper_positions.len(),
+                            "trade_count": s.trade_count(),
+                            "win_rate": s.win_rate(),
+                            "avg_pnl_pct": s.avg_pnl_pct(),
+                            "max_loss_pct": s.max_loss_pct(),
+                            "fitness_score": s.fitness_score(),
+                            "total_pnl_pct": s.total_pnl_pct(),
+                            "started_at": s.started_at,
+                            "history": s.paper_history.iter().rev().take(50).collect::<Vec<_>>(),
+                        })
+                    }).collect();
+                    let body = serde_json::json!({
+                        "active": g.experiment_active,
+                        "cycle_id": g.experiment_cycle_id,
+                        "slots": slots,
+                    }).to_string();
+                    json_200(body)
+                }
+
+                "/api/experiment/start" => {
+                    if method.as_str() != "POST" {
+                        json_err("405 Method Not Allowed", r#"{"error":"method not allowed"}"#)
+                    } else {
+                        let body = extract_body(&req);
+                        #[derive(serde::Deserialize)]
+                        struct SlotInput {
+                            id: u8,
+                            label: String,
+                            ai_provider: String,
+                            config: crate::engine::paper::RuntimeConfig,
+                        }
+                        #[derive(serde::Deserialize)]
+                        struct StartInput { slots: Vec<SlotInput>, balance: Option<f64> }
+                        match serde_json::from_str::<StartInput>(body) {
+                            Ok(input) if !input.slots.is_empty() => {
+                                let balance = input.balance.unwrap_or(10_000.0).max(100.0);
+                                let slots = input.slots.into_iter()
+                                    .filter(|s| s.config.validate())
+                                    .map(|s| crate::engine::state::ExperimentSlot::new(s.id, s.label, s.ai_provider, s.config, balance))
+                                    .collect::<Vec<_>>();
+                                let cycle_id = {
+                                    let mut st = state.write().await;
+                                    st.start_experiment(slots);
+                                    st.experiment_cycle_id
+                                };
+                                json_200(serde_json::json!({"ok":true,"cycle_id":cycle_id}).to_string())
+                            }
+                            _ => json_err("400 Bad Request", r#"{"error":"invalid slots payload"}"#),
+                        }
+                    }
+                }
+
+                "/api/experiment/stop" => {
+                    if method.as_str() != "POST" {
+                        json_err("405 Method Not Allowed", r#"{"error":"method not allowed"}"#)
+                    } else {
+                        let cycle_id = { let mut st = state.write().await; st.stop_experiment(); st.experiment_cycle_id };
+                        json_200(serde_json::json!({"ok":true,"cycle_id":cycle_id}).to_string())
+                    }
+                }
+
+                "/api/experiment/reset" => {
+                    if method.as_str() != "POST" {
+                        json_err("405 Method Not Allowed", r#"{"error":"method not allowed"}"#)
+                    } else {
+                        let body = extract_body(&req);
+                        let balance: f64 = serde_json::from_str::<serde_json::Value>(body)
+                            .ok().and_then(|v| v.get("balance").and_then(|b| b.as_f64()))
+                            .unwrap_or(10_000.0).max(100.0);
+                        { let mut st = state.write().await; st.reset_experiment_slots(balance); }
+                        json_200(r#"{"ok":true}"#.to_string())
+                    }
                 }
 
                 _ => json_err("404 Not Found", r#"{"error":"not found"}"#),

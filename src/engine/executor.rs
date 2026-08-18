@@ -51,7 +51,8 @@ async fn process_signal(
     runtime: Arc<RwLock<RuntimeConfig>>,
 ) -> AppResult<()> {
     if config.dry_run {
-        return open_paper_position(signal, state, runtime).await;
+        open_paper_position(signal.clone(), Arc::clone(&state), Arc::clone(&runtime)).await?;
+        return open_experiment_slot_positions(signal, state).await;
     }
 
     let (usdt_to_use, quantity, filters) = {
@@ -263,6 +264,44 @@ async fn open_paper_position(
         "Paper position opened"
     );
     st.open_paper_position(pos);
+    Ok(())
+}
+
+async fn open_experiment_slot_positions(
+    signal: MomentumSignal,
+    state: Arc<RwLock<GlobalState>>,
+) -> AppResult<()> {
+    let mut st = state.write().await;
+    if !st.experiment_active { return Ok(()); }
+    for slot in &mut st.experiment_slots {
+        if signal.pct_change < slot.config.momentum_trigger_pct { continue; }
+        if signal.volume_surge < slot.config.volume_surge_multiplier { continue; }
+        if slot.paper_positions.contains_key(&signal.symbol) { continue; }
+        if slot.paper_positions.len() >= slot.config.max_positions { continue; }
+        let virtual_usdt = slot.paper_balance * slot.config.position_size_pct / 100.0;
+        if virtual_usdt <= 0.0 || virtual_usdt > slot.paper_balance { continue; }
+        let stop_price = signal.current_price * (1.0 - slot.config.stop_loss_pct / 100.0);
+        let take_profit_price = signal.current_price * (1.0 + slot.config.take_profit_pct / 100.0);
+        let quantity = virtual_usdt / signal.current_price;
+        let pos = PaperPosition {
+            symbol: signal.symbol.clone(),
+            entry_price: signal.current_price,
+            quantity,
+            virtual_usdt,
+            stop_price,
+            take_profit_price,
+            opened_at: now_ms(),
+            stop_loss_pct: slot.config.stop_loss_pct,
+            take_profit_pct: slot.config.take_profit_pct,
+            momentum_trigger_pct: slot.config.momentum_trigger_pct,
+            momentum_window_secs: slot.config.momentum_window_secs,
+            volume_surge_multiplier: slot.config.volume_surge_multiplier,
+            highest_price_seen: signal.current_price,
+            trailing_stop_distance_pct: slot.config.trailing_stop_distance_pct,
+        };
+        slot.open_position(pos);
+        tracing::debug!(slot_id = slot.id, label = %slot.label, symbol = %signal.symbol, "Experiment slot position opened");
+    }
     Ok(())
 }
 

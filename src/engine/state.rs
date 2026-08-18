@@ -1,13 +1,115 @@
 use crate::binance::exchange_info::ExchangeInfoCache;
 use crate::binance::models::{AccountInfo, AssetBalance};
 use crate::engine::arb::ArbOpportunity;
-use crate::engine::paper::{PaperPosition, PaperTrade, ScannerCandidate};
+use crate::engine::paper::{now_ms, PaperPosition, PaperTrade, RuntimeConfig, ScannerCandidate};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 const SIGNAL_BUFFER_CAPACITY: usize = 200;
 const PAPER_HISTORY_CAPACITY: usize = 500;
 const ARB_HISTORY_CAPACITY: usize = 500;
+const EXPERIMENT_HISTORY_CAPACITY: usize = 200;
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ExperimentSlot {
+    pub id: u8,
+    pub label: String,
+    pub ai_provider: String,
+    pub config: RuntimeConfig,
+    pub paper_balance: f64,
+    pub paper_positions: HashMap<String, PaperPosition>,
+    pub paper_history: VecDeque<PaperTrade>,
+    pub initial_balance: f64,
+    pub started_at: i64,
+}
+
+impl ExperimentSlot {
+    pub fn new(id: u8, label: String, ai_provider: String, config: RuntimeConfig, balance: f64) -> Self {
+        Self {
+            id,
+            label,
+            ai_provider,
+            config,
+            paper_balance: balance,
+            paper_positions: HashMap::new(),
+            paper_history: VecDeque::with_capacity(EXPERIMENT_HISTORY_CAPACITY),
+            initial_balance: balance,
+            started_at: now_ms(),
+        }
+    }
+
+    pub fn trade_count(&self) -> usize { self.paper_history.len() }
+
+    pub fn win_rate(&self) -> f64 {
+        if self.paper_history.is_empty() { return 0.0; }
+        let wins = self.paper_history.iter().filter(|t| t.pnl_usdt > 0.0).count();
+        wins as f64 / self.paper_history.len() as f64
+    }
+
+    pub fn avg_pnl_pct(&self) -> f64 {
+        if self.paper_history.is_empty() { return 0.0; }
+        self.paper_history.iter().map(|t| t.pnl_pct).sum::<f64>() / self.paper_history.len() as f64
+    }
+
+    pub fn max_loss_pct(&self) -> f64 {
+        self.paper_history.iter()
+            .map(|t| if t.pnl_pct < 0.0 { t.pnl_pct.abs() } else { 0.0 })
+            .fold(0.0_f64, f64::max)
+    }
+
+    pub fn fitness_score(&self) -> f64 {
+        let ml = self.max_loss_pct();
+        if ml <= 0.0 || self.paper_history.len() < 3 { return 0.0; }
+        self.win_rate() * self.avg_pnl_pct().max(0.0) / ml
+    }
+
+    pub fn total_pnl_pct(&self) -> f64 {
+        if self.initial_balance <= 0.0 { return 0.0; }
+        (self.paper_balance - self.initial_balance) / self.initial_balance * 100.0
+    }
+
+    pub fn open_position(&mut self, pos: PaperPosition) {
+        self.paper_balance = (self.paper_balance - pos.virtual_usdt).max(0.0);
+        self.paper_positions.insert(pos.symbol.clone(), pos);
+    }
+
+    pub fn close_position(&mut self, symbol: &str, exit_price: f64, exit_reason: &str, closed_at: i64) -> Option<PaperTrade> {
+        let pos = self.paper_positions.remove(symbol)?;
+        let pnl_usdt = (exit_price - pos.entry_price) * pos.quantity;
+        let pnl_pct = (exit_price - pos.entry_price) / pos.entry_price * 100.0;
+        self.paper_balance += pos.virtual_usdt + pnl_usdt;
+        let trade = PaperTrade {
+            symbol: symbol.to_owned(),
+            entry_price: pos.entry_price,
+            exit_price,
+            quantity: pos.quantity,
+            virtual_usdt: pos.virtual_usdt,
+            pnl_usdt,
+            pnl_pct,
+            exit_reason: exit_reason.to_owned(),
+            opened_at: pos.opened_at,
+            closed_at,
+            duration_ms: closed_at - pos.opened_at,
+            stop_loss_pct: pos.stop_loss_pct,
+            take_profit_pct: pos.take_profit_pct,
+            momentum_trigger_pct: pos.momentum_trigger_pct,
+            momentum_window_secs: pos.momentum_window_secs,
+            volume_surge_multiplier: pos.volume_surge_multiplier,
+        };
+        if self.paper_history.len() >= EXPERIMENT_HISTORY_CAPACITY {
+            self.paper_history.pop_front();
+        }
+        self.paper_history.push_back(trade.clone());
+        Some(trade)
+    }
+
+    pub fn update_trailing(&mut self, symbol: &str, new_stop: f64, new_highest: f64) {
+        if let Some(pos) = self.paper_positions.get_mut(symbol) {
+            if new_stop > pos.stop_price { pos.stop_price = new_stop; }
+            if new_highest > pos.highest_price_seen { pos.highest_price_seen = new_highest; }
+        }
+    }
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SignalRecord {
@@ -50,6 +152,9 @@ pub struct GlobalState {
     pub btc_filter_ok: bool,
     pub arb_opportunities: VecDeque<ArbOpportunity>,
     pub arb_triangles_monitored: usize,
+    pub experiment_slots: Vec<ExperimentSlot>,
+    pub experiment_active: bool,
+    pub experiment_cycle_id: u64,
 }
 
 impl GlobalState {
@@ -82,6 +187,9 @@ impl GlobalState {
             btc_filter_ok: true,
             arb_opportunities: VecDeque::with_capacity(ARB_HISTORY_CAPACITY),
             arb_triangles_monitored: 0,
+            experiment_slots: Vec::new(),
+            experiment_active: false,
+            experiment_cycle_id: 0,
         }
     }
 
@@ -103,7 +211,34 @@ impl GlobalState {
             btc_filter_ok: true,
             arb_opportunities: VecDeque::with_capacity(ARB_HISTORY_CAPACITY),
             arb_triangles_monitored: 0,
+            experiment_slots: Vec::new(),
+            experiment_active: false,
+            experiment_cycle_id: 0,
         }
+    }
+
+    pub fn start_experiment(&mut self, slots: Vec<ExperimentSlot>) {
+        self.experiment_slots = slots;
+        self.experiment_active = true;
+        self.experiment_cycle_id += 1;
+        tracing::info!(cycle_id = self.experiment_cycle_id, slots = self.experiment_slots.len(), "Experiment started");
+    }
+
+    pub fn stop_experiment(&mut self) {
+        self.experiment_active = false;
+        tracing::info!(cycle_id = self.experiment_cycle_id, "Experiment stopped");
+    }
+
+    pub fn reset_experiment_slots(&mut self, balance: f64) {
+        for slot in &mut self.experiment_slots {
+            slot.paper_balance = balance;
+            slot.paper_positions.clear();
+            slot.paper_history.clear();
+            slot.initial_balance = balance;
+            slot.started_at = now_ms();
+        }
+        self.experiment_active = false;
+        tracing::info!("Experiment slots reset");
     }
 
     pub fn push_signal(&mut self, signal: SignalRecord) {
