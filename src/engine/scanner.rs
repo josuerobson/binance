@@ -1,5 +1,6 @@
 use crate::binance::models::{BookTickerEvent, MiniTickerEvent};
 use crate::config::ScannerConfig;
+use crate::engine::arb::{ArbOpportunity, ArbScanner};
 use crate::engine::paper::{now_ms, RuntimeConfig, ScannerCandidate};
 use crate::engine::state::GlobalState;
 use crate::error::{AppError, AppResult};
@@ -44,6 +45,8 @@ pub struct Scanner {
     buffers: HashMap<String, VecDeque<PriceTick>>,
     last_quote_volume: HashMap<String, f64>,
     book_tickers: HashMap<String, (f64, f64)>,
+    arb_scanner: ArbScanner,
+    arb_pending: Vec<ArbOpportunity>,
 }
 
 impl Scanner {
@@ -61,6 +64,24 @@ impl Scanner {
                 }
             }
         }
+        // Detect triangular arb opportunities on every book ticker batch.
+        let new_opps = self.arb_scanner.detect(&self.book_tickers);
+        if !new_opps.is_empty() {
+            self.arb_pending.extend(new_opps);
+            // Keep pending buffer from growing unboundedly between 3-second flushes.
+            if self.arb_pending.len() > 100 {
+                self.arb_pending.sort_by(|a, b| b.net_pct.partial_cmp(&a.net_pct).unwrap_or(std::cmp::Ordering::Equal));
+                self.arb_pending.truncate(50);
+            }
+        }
+    }
+
+    pub fn drain_arb_opportunities(&mut self) -> Vec<ArbOpportunity> {
+        std::mem::take(&mut self.arb_pending)
+    }
+
+    pub fn arb_triangles_monitored(&self) -> usize {
+        self.arb_scanner.triangles_monitored
     }
 
     pub fn process_mini_ticker(
@@ -359,7 +380,7 @@ pub async fn run_scanner(
                             }
                         }
 
-                        // Update scanner candidates + BTC status every 3 seconds.
+                        // Update scanner candidates, BTC status, and arb opportunities every 3 seconds.
                         let now = now_ms();
                         if now - last_candidates_update >= 3_000 {
                             last_candidates_update = now;
@@ -369,9 +390,15 @@ pub async fn run_scanner(
                                 let state_guard = state.read().await;
                                 scanner.collect_candidates(&rt, &state_guard)
                             };
+                            let arb_opps = scanner.drain_arb_opportunities();
+                            let arb_triangles = scanner.arb_triangles_monitored();
                             let mut st = state.write().await;
                             st.set_scanner_candidates(candidates);
                             st.set_btc_status(btc_mom, btc_ok);
+                            st.set_arb_triangles(arb_triangles);
+                            for opp in arb_opps {
+                                st.push_arb_opportunity(opp);
+                            }
                         }
 
                         for signal in signals {

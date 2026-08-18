@@ -1,11 +1,13 @@
 use crate::binance::exchange_info::ExchangeInfoCache;
 use crate::binance::models::{AccountInfo, AssetBalance};
+use crate::engine::arb::ArbOpportunity;
 use crate::engine::paper::{PaperPosition, PaperTrade, ScannerCandidate};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 const SIGNAL_BUFFER_CAPACITY: usize = 200;
 const PAPER_HISTORY_CAPACITY: usize = 500;
+const ARB_HISTORY_CAPACITY: usize = 500;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SignalRecord {
@@ -46,6 +48,8 @@ pub struct GlobalState {
     pub scanner_candidates: Vec<ScannerCandidate>,
     pub btc_momentum_pct: Option<f64>,
     pub btc_filter_ok: bool,
+    pub arb_opportunities: VecDeque<ArbOpportunity>,
+    pub arb_triangles_monitored: usize,
 }
 
 impl GlobalState {
@@ -76,6 +80,8 @@ impl GlobalState {
             scanner_candidates: Vec::new(),
             btc_momentum_pct: None,
             btc_filter_ok: true,
+            arb_opportunities: VecDeque::with_capacity(ARB_HISTORY_CAPACITY),
+            arb_triangles_monitored: 0,
         }
     }
 
@@ -95,6 +101,8 @@ impl GlobalState {
             scanner_candidates: Vec::new(),
             btc_momentum_pct: None,
             btc_filter_ok: true,
+            arb_opportunities: VecDeque::with_capacity(ARB_HISTORY_CAPACITY),
+            arb_triangles_monitored: 0,
         }
     }
 
@@ -247,6 +255,17 @@ impl GlobalState {
     pub fn set_btc_status(&mut self, momentum_pct: Option<f64>, filter_ok: bool) {
         self.btc_momentum_pct = momentum_pct;
         self.btc_filter_ok = filter_ok;
+    }
+
+    pub fn push_arb_opportunity(&mut self, opp: ArbOpportunity) {
+        if self.arb_opportunities.len() >= ARB_HISTORY_CAPACITY {
+            self.arb_opportunities.pop_front();
+        }
+        self.arb_opportunities.push_back(opp);
+    }
+
+    pub fn set_arb_triangles(&mut self, count: usize) {
+        self.arb_triangles_monitored = count;
     }
 }
 

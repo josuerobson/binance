@@ -101,6 +101,7 @@ pub async fn run_health_server(
                     | "/api/paper/history"
                     | "/api/runtime/config"
                     | "/api/scanner/candidates"
+                    | "/api/arb/opportunities"
             );
             if needs_auth && !auth_ok(&req, &config.dashboard_api_key) {
                 let resp = json_err("401 Unauthorized", r#"{"error":"Unauthorized"}"#);
@@ -323,6 +324,22 @@ pub async fn run_health_server(
                         "btc_filter_enabled": rt.btc_filter_enabled,
                         "btc_filter_window_secs": rt.btc_filter_window_secs,
                         "btc_min_momentum_pct": rt.btc_min_momentum_pct,
+                    })
+                    .to_string();
+                    json_200(body)
+                }
+
+                "/api/arb/opportunities" => {
+                    let g = state.read().await;
+                    let opps: Vec<_> = g.arb_opportunities.iter().rev().cloned().collect();
+                    let profitable = opps.iter().filter(|o| o.net_pct > 0.0).count();
+                    let best_net = opps.iter().map(|o| o.net_pct).fold(f64::NEG_INFINITY, f64::max);
+                    let body = serde_json::json!({
+                        "count": opps.len(),
+                        "triangles_monitored": g.arb_triangles_monitored,
+                        "profitable_count": profitable,
+                        "best_net_pct": if best_net.is_finite() { serde_json::Value::from(best_net) } else { serde_json::Value::Null },
+                        "opportunities": opps,
                     })
                     .to_string();
                     json_200(body)
