@@ -1,6 +1,7 @@
 use crate::binance::client::BinanceClient;
 use crate::binance::models::{OrderListParams, OrderResponse, Side, UserDataEvent};
 use crate::config::AppConfig;
+use crate::engine::paper::{now_ms, PaperPosition, RuntimeConfig};
 use crate::engine::risk::{
     apply_tick_size, calculate_quantity, check_balance, check_position_limit,
     validate_order_filters,
@@ -17,12 +18,13 @@ pub async fn run_executor(
     client: Arc<BinanceClient>,
     state: Arc<RwLock<GlobalState>>,
     config: AppConfig,
+    runtime: Arc<RwLock<RuntimeConfig>>,
 ) -> AppResult<()> {
     loop {
         tokio::select! {
             signal = signal_rx.recv() => {
                 let signal = signal.ok_or_else(|| AppError::ChannelClosed("signal channel".to_owned()))?;
-                if let Err(error) = process_signal(signal, Arc::clone(&client), Arc::clone(&state), &config).await {
+                if let Err(error) = process_signal(signal, Arc::clone(&client), Arc::clone(&state), &config, Arc::clone(&runtime)).await {
                     tracing::error!(error = %error, "Signal processing failed");
                 }
             }
@@ -46,16 +48,10 @@ async fn process_signal(
     client: Arc<BinanceClient>,
     state: Arc<RwLock<GlobalState>>,
     config: &AppConfig,
+    runtime: Arc<RwLock<RuntimeConfig>>,
 ) -> AppResult<()> {
     if config.dry_run {
-        tracing::info!(
-            symbol = %signal.symbol,
-            price = %signal.current_price,
-            momentum_pct = %signal.pct_change,
-            volume_surge = %signal.volume_surge,
-            "DRY_RUN signal; no order submitted"
-        );
-        return Ok(());
+        return open_paper_position(signal, state, runtime).await;
     }
 
     let (usdt_to_use, quantity, filters) = {
@@ -215,6 +211,56 @@ async fn process_signal(
     state_guard.update_usdt_balance(remaining_balance);
     tracing::info!(symbol = %signal.symbol, order_id = market_order.order_id, fill_price = %fill_price, quantity = %executed_qty, "Market order filled");
     tracing::info!(symbol = %signal.symbol, stop_price = %protection.below_stop_price.clone().unwrap_or_default(), take_profit_price = %protection.above_price.clone().unwrap_or_default(), "Order list placed");
+    Ok(())
+}
+
+async fn open_paper_position(
+    signal: MomentumSignal,
+    state: Arc<RwLock<GlobalState>>,
+    runtime: Arc<RwLock<RuntimeConfig>>,
+) -> AppResult<()> {
+    let rt = runtime.read().await.clone();
+    let mut st = state.write().await;
+
+    if st.paper_active_count() >= rt.max_positions {
+        tracing::debug!(symbol = %signal.symbol, "Paper position limit reached; signal ignored");
+        return Ok(());
+    }
+    if st.has_paper_symbol(&signal.symbol) {
+        tracing::debug!(symbol = %signal.symbol, "Paper position already open; signal ignored");
+        return Ok(());
+    }
+    let virtual_usdt = st.paper_balance * rt.position_size_pct / 100.0;
+    if virtual_usdt > st.paper_balance || virtual_usdt <= 0.0 {
+        tracing::debug!(symbol = %signal.symbol, "Insufficient paper balance; signal ignored");
+        return Ok(());
+    }
+    let stop_price = signal.current_price * (1.0 - rt.stop_loss_pct / 100.0);
+    let take_profit_price = signal.current_price * (1.0 + rt.take_profit_pct / 100.0);
+    let quantity = virtual_usdt / signal.current_price;
+    let pos = PaperPosition {
+        symbol: signal.symbol.clone(),
+        entry_price: signal.current_price,
+        quantity,
+        virtual_usdt,
+        stop_price,
+        take_profit_price,
+        opened_at: now_ms(),
+        stop_loss_pct: rt.stop_loss_pct,
+        take_profit_pct: rt.take_profit_pct,
+        momentum_trigger_pct: rt.momentum_trigger_pct,
+        momentum_window_secs: rt.momentum_window_secs,
+        volume_surge_multiplier: rt.volume_surge_multiplier,
+    };
+    tracing::info!(
+        symbol = %signal.symbol,
+        entry = %signal.current_price,
+        stop = %stop_price,
+        tp = %take_profit_price,
+        virtual_usdt = %virtual_usdt,
+        "Paper position opened"
+    );
+    st.open_paper_position(pos);
     Ok(())
 }
 
@@ -459,6 +505,7 @@ mod tests {
                 request_weight_limit_per_minute: 6000,
             },
             server: ServerConfig { health_port: 8080 },
+            dashboard_api_key: "test".into(),
         }
     }
 

@@ -1,9 +1,11 @@
 use crate::binance::exchange_info::ExchangeInfoCache;
 use crate::binance::models::{AccountInfo, AssetBalance};
+use crate::engine::paper::{PaperPosition, PaperTrade};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 const SIGNAL_BUFFER_CAPACITY: usize = 200;
+const PAPER_HISTORY_CAPACITY: usize = 500;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SignalRecord {
@@ -38,6 +40,9 @@ pub struct GlobalState {
     pub usdt_balance: f64,
     pub exchange_info: Arc<ExchangeInfoCache>,
     pub recent_signals: VecDeque<SignalRecord>,
+    pub paper_positions: HashMap<String, PaperPosition>,
+    pub paper_history: VecDeque<PaperTrade>,
+    pub paper_balance: f64,
 }
 
 impl GlobalState {
@@ -62,6 +67,9 @@ impl GlobalState {
             usdt_balance,
             exchange_info: Arc::new(ExchangeInfoCache::new()),
             recent_signals: VecDeque::with_capacity(SIGNAL_BUFFER_CAPACITY),
+            paper_positions: HashMap::new(),
+            paper_history: VecDeque::with_capacity(PAPER_HISTORY_CAPACITY),
+            paper_balance: 10_000.0,
         }
     }
 
@@ -75,6 +83,9 @@ impl GlobalState {
             usdt_balance,
             exchange_info: Arc::new(ExchangeInfoCache::new()),
             recent_signals: VecDeque::with_capacity(SIGNAL_BUFFER_CAPACITY),
+            paper_positions: HashMap::new(),
+            paper_history: VecDeque::with_capacity(PAPER_HISTORY_CAPACITY),
+            paper_balance: 10_000.0,
         }
     }
 
@@ -151,6 +162,61 @@ impl GlobalState {
     pub fn update_usdt_balance(&mut self, value: f64) {
         if value.is_finite() && value >= 0.0 {
             self.usdt_balance = value;
+        }
+    }
+
+    pub fn open_paper_position(&mut self, pos: PaperPosition) {
+        self.paper_balance = (self.paper_balance - pos.virtual_usdt).max(0.0);
+        self.paper_positions.insert(pos.symbol.clone(), pos);
+    }
+
+    pub fn close_paper_position(
+        &mut self,
+        symbol: &str,
+        exit_price: f64,
+        exit_reason: &str,
+        closed_at: i64,
+    ) -> Option<PaperTrade> {
+        let pos = self.paper_positions.remove(symbol)?;
+        let pnl_usdt = (exit_price - pos.entry_price) * pos.quantity;
+        let pnl_pct = (exit_price - pos.entry_price) / pos.entry_price * 100.0;
+        self.paper_balance += pos.virtual_usdt + pnl_usdt;
+        let trade = PaperTrade {
+            symbol: symbol.to_owned(),
+            entry_price: pos.entry_price,
+            exit_price,
+            quantity: pos.quantity,
+            virtual_usdt: pos.virtual_usdt,
+            pnl_usdt,
+            pnl_pct,
+            exit_reason: exit_reason.to_owned(),
+            opened_at: pos.opened_at,
+            closed_at,
+            duration_ms: closed_at - pos.opened_at,
+            stop_loss_pct: pos.stop_loss_pct,
+            take_profit_pct: pos.take_profit_pct,
+            momentum_trigger_pct: pos.momentum_trigger_pct,
+            momentum_window_secs: pos.momentum_window_secs,
+            volume_surge_multiplier: pos.volume_surge_multiplier,
+        };
+        if self.paper_history.len() >= PAPER_HISTORY_CAPACITY {
+            self.paper_history.pop_front();
+        }
+        self.paper_history.push_back(trade.clone());
+        Some(trade)
+    }
+
+    pub fn has_paper_symbol(&self, symbol: &str) -> bool {
+        self.paper_positions.contains_key(symbol)
+    }
+
+    pub fn paper_active_count(&self) -> usize {
+        self.paper_positions.len()
+    }
+
+    pub fn set_paper_balance(&mut self, balance: f64) {
+        if balance.is_finite() && balance >= 0.0 {
+            self.paper_balance = balance;
         }
     }
 }

@@ -1,9 +1,10 @@
 use crate::binance::client::BinanceClient;
 use crate::config::AppConfig;
+use crate::engine::paper::{now_ms, RuntimeConfig};
 use crate::engine::state::{reconcile_state, GlobalState};
 use crate::error::{AppError, AppResult};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
@@ -14,6 +15,21 @@ fn extract_path(request: &str) -> &str {
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .unwrap_or("/")
+}
+
+fn extract_method(request: &str) -> &str {
+    request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().next())
+        .unwrap_or("GET")
+}
+
+fn extract_body(request: &str) -> &str {
+    request
+        .find("\r\n\r\n")
+        .map(|pos| request[pos + 4..].trim_end_matches('\0'))
+        .unwrap_or("")
 }
 
 fn extract_api_key(request: &str) -> Option<&str> {
@@ -30,13 +46,6 @@ fn auth_ok(request: &str, expected: &str) -> bool {
         return true;
     }
     extract_api_key(request).map_or(false, |k| k == expected)
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
 }
 
 fn json_200(body: String) -> String {
@@ -57,6 +66,7 @@ pub async fn run_health_server(
     state: Arc<RwLock<GlobalState>>,
     config: Arc<AppConfig>,
     client: Arc<BinanceClient>,
+    runtime: Arc<RwLock<RuntimeConfig>>,
 ) -> AppResult<()> {
     let port = config.server.health_port;
     let listener = TcpListener::bind(("0.0.0.0", port))
@@ -71,18 +81,25 @@ pub async fn run_health_server(
         let state = Arc::clone(&state);
         let config = Arc::clone(&config);
         let client = Arc::clone(&client);
+        let runtime = Arc::clone(&runtime);
         tokio::spawn(async move {
-            let mut buf = [0_u8; 4096];
+            let mut buf = [0_u8; 8192];
             let Ok(n) = socket.read(&mut buf).await else {
                 return;
             };
             let req = String::from_utf8_lossy(&buf[..n]);
             let path = extract_path(&req).to_owned();
+            let method = extract_method(&req).to_owned();
 
-            // Protected routes require X-Api-Key
             let needs_auth = matches!(
                 path.as_str(),
-                "/api/snapshot" | "/api/signals" | "/api/config" | "/api/latency"
+                "/api/snapshot"
+                    | "/api/signals"
+                    | "/api/config"
+                    | "/api/latency"
+                    | "/api/paper/positions"
+                    | "/api/paper/history"
+                    | "/api/runtime/config"
             );
             if needs_auth && !auth_ok(&req, &config.dashboard_api_key) {
                 let resp = json_err("401 Unauthorized", r#"{"error":"Unauthorized"}"#);
@@ -226,6 +243,71 @@ pub async fn run_health_server(
                             let msg = e.to_string();
                             json_err("502 Bad Gateway", &format!(r#"{{"error":{}}}"#, serde_json::json!(msg)))
                         }
+                    }
+                }
+
+                "/api/paper/positions" => {
+                    let g = state.read().await;
+                    let positions: Vec<_> = g.paper_positions.values().collect();
+                    let body = serde_json::json!({
+                        "count": positions.len(),
+                        "paper_balance": g.paper_balance,
+                        "positions": positions,
+                    })
+                    .to_string();
+                    json_200(body)
+                }
+
+                "/api/paper/history" => {
+                    let g = state.read().await;
+                    let history: Vec<_> = g.paper_history.iter().rev().cloned().collect();
+                    let wins = history.iter().filter(|t| t.pnl_usdt > 0.0).count();
+                    let total = history.len();
+                    let total_pnl: f64 = history.iter().map(|t| t.pnl_usdt).sum();
+                    let body = serde_json::json!({
+                        "count": total,
+                        "wins": wins,
+                        "losses": total - wins,
+                        "win_rate_pct": if total > 0 { wins as f64 / total as f64 * 100.0 } else { 0.0 },
+                        "total_pnl_usdt": total_pnl,
+                        "paper_balance": g.paper_balance,
+                        "history": history,
+                    })
+                    .to_string();
+                    json_200(body)
+                }
+
+                "/api/runtime/config" => {
+                    match method.as_str() {
+                        "GET" => {
+                            let rt = runtime.read().await.clone();
+                            json_200(serde_json::to_string(&rt).unwrap_or_default())
+                        }
+                        "POST" => {
+                            let body = extract_body(&req);
+                            match serde_json::from_str::<RuntimeConfig>(body) {
+                                Ok(new_cfg) if new_cfg.validate() => {
+                                    let mut rt = runtime.write().await;
+                                    // Update paper_balance in state if it changed
+                                    if (new_cfg.paper_balance - rt.paper_balance).abs() > f64::EPSILON {
+                                        let mut st = state.write().await;
+                                        st.set_paper_balance(new_cfg.paper_balance);
+                                    }
+                                    *rt = new_cfg;
+                                    tracing::info!("Runtime config updated via API");
+                                    json_200(serde_json::to_string(&*rt).unwrap_or_default())
+                                }
+                                Ok(_) => json_err(
+                                    "400 Bad Request",
+                                    r#"{"error":"invalid config values"}"#,
+                                ),
+                                Err(_) => json_err(
+                                    "400 Bad Request",
+                                    r#"{"error":"invalid JSON body"}"#,
+                                ),
+                            }
+                        }
+                        _ => json_err("405 Method Not Allowed", r#"{"error":"method not allowed"}"#),
                     }
                 }
 

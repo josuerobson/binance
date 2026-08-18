@@ -5,6 +5,7 @@ use binance_momentum::binance::ws::{
 };
 use binance_momentum::config::AppConfig;
 use binance_momentum::engine::executor::run_executor;
+use binance_momentum::engine::paper::RuntimeConfig;
 use binance_momentum::engine::scanner::run_scanner;
 use binance_momentum::engine::state::{reconcile_state, GlobalState};
 use binance_momentum::error::{AppError, AppResult};
@@ -46,6 +47,8 @@ async fn run() -> AppResult<()> {
         ));
     }
     let state = Arc::new(RwLock::new(GlobalState::new(&account)));
+
+    let runtime = Arc::new(RwLock::new(RuntimeConfig::from_app_config(&config)));
 
     let exchange_cache = { state.read().await.exchange_info.clone() };
     exchange_cache.refresh(&client).await?;
@@ -97,15 +100,15 @@ async fn run() -> AppResult<()> {
     }
     {
         let state_for_scanner = Arc::clone(&state);
-        let scanner_config = config.scanner.clone();
-        let min_volume = config.risk.min_24h_volume_usdt;
+        let static_cfg = config.scanner.clone();
+        let runtime_for_scanner = Arc::clone(&runtime);
         tasks.spawn(async move {
             run_scanner(
                 market_rx,
                 book_rx,
                 signal_tx,
-                scanner_config,
-                min_volume,
+                static_cfg,
+                runtime_for_scanner,
                 state_for_scanner,
             )
             .await
@@ -115,6 +118,7 @@ async fn run() -> AppResult<()> {
         let client_for_executor = Arc::clone(&client);
         let state_for_executor = Arc::clone(&state);
         let executor_config = config.clone();
+        let runtime_for_executor = Arc::clone(&runtime);
         tasks.spawn(async move {
             run_executor(
                 signal_rx,
@@ -122,6 +126,7 @@ async fn run() -> AppResult<()> {
                 client_for_executor,
                 state_for_executor,
                 executor_config,
+                runtime_for_executor,
             )
             .await
         });
@@ -130,8 +135,15 @@ async fn run() -> AppResult<()> {
         let state_for_health = Arc::clone(&state);
         let config_for_health = Arc::new(config.clone());
         let client_for_health = Arc::clone(&client);
+        let runtime_for_health = Arc::clone(&runtime);
         tasks.spawn(async move {
-            run_health_server(state_for_health, config_for_health, client_for_health).await
+            run_health_server(
+                state_for_health,
+                config_for_health,
+                client_for_health,
+                runtime_for_health,
+            )
+            .await
         });
     }
     {
