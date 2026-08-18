@@ -367,7 +367,7 @@ pub async fn run_health_server(
                             "fitness_score": s.fitness_score(),
                             "total_pnl_pct": s.total_pnl_pct(),
                             "started_at": s.started_at,
-                            "history": s.paper_history.iter().rev().take(50).collect::<Vec<_>>(),
+                            "history": s.paper_history.iter().rev().collect::<Vec<_>>(),
                         })
                     }).collect();
                     let body = serde_json::json!({

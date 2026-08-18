@@ -8,7 +8,7 @@ use std::sync::Arc;
 const SIGNAL_BUFFER_CAPACITY: usize = 200;
 const PAPER_HISTORY_CAPACITY: usize = 500;
 const ARB_HISTORY_CAPACITY: usize = 500;
-const EXPERIMENT_HISTORY_CAPACITY: usize = 200;
+const EXPERIMENT_HISTORY_CAPACITY: usize = 400;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ExperimentSlot {
