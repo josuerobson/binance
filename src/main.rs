@@ -40,13 +40,20 @@ async fn run() -> AppResult<()> {
     client.set_clock_delta_ms(clock_delta_ms);
     tracing::info!(clock_delta_ms, "Binance server clock synchronized");
 
-    let account = client.get_account_info().await?;
-    if !account.can_trade && !config.dry_run {
-        return Err(AppError::InvalidConfig(
-            "Binance account cannot trade while live execution is enabled".to_owned(),
-        ));
-    }
-    let state = Arc::new(RwLock::new(GlobalState::new(&account)));
+    // In DRY_RUN mode all authenticated REST calls are skipped — paper trading uses
+    // virtual balances and mainnet WebSocket streams need no credentials.
+    let state = if config.dry_run {
+        tracing::info!("DRY_RUN mode: skipping account verification, paper balance active");
+        Arc::new(RwLock::new(GlobalState::with_balance(0.0)))
+    } else {
+        let account = client.get_account_info().await?;
+        if !account.can_trade {
+            return Err(AppError::InvalidConfig(
+                "Binance account cannot trade while live execution is enabled".to_owned(),
+            ));
+        }
+        Arc::new(RwLock::new(GlobalState::new(&account)))
+    };
 
     let runtime = Arc::new(RwLock::new(RuntimeConfig::from_app_config(&config)));
 
@@ -57,18 +64,22 @@ async fn run() -> AppResult<()> {
             "exchangeInfo returned no eligible USDT symbols".to_owned(),
         ));
     }
-    reconcile_state(&client, &state).await?;
+    if !config.dry_run {
+        reconcile_state(&client, &state).await?;
+    }
 
-    // POST /api/v3/userDataStream foi removido do Testnet (HTTP 410).
-    // Quando ausente, o bot continua sem User Data Stream e usa apenas a
-    // reconciliação REST para rastrear posições.
-    let listen_key: Option<String> = match client.get_listen_key().await {
-        Ok(key) => Some(key),
-        Err(AppError::BinanceHttp { status: 410, .. }) => {
-            tracing::warn!("POST /api/v3/userDataStream returned 410 Gone — User Data Stream unavailable; position tracking via REST reconciliation only");
-            None
+    let listen_key: Option<String> = if config.dry_run {
+        tracing::info!("DRY_RUN mode — skipping User Data Stream setup");
+        None
+    } else {
+        match client.get_listen_key().await {
+            Ok(key) => Some(key),
+            Err(AppError::BinanceHttp { status: 410, .. }) => {
+                tracing::warn!("POST /api/v3/userDataStream returned 410 Gone — User Data Stream unavailable; position tracking via REST reconciliation only");
+                None
+            }
+            Err(e) => return Err(e),
         }
-        Err(e) => return Err(e),
     };
     let symbols = exchange_cache.symbols();
     tracing::info!(symbols = symbols.len(), user_data_stream = listen_key.is_some(), "Preflight completed");
@@ -158,7 +169,7 @@ async fn run() -> AppResult<()> {
             .await
         });
     }
-    {
+    if !config.dry_run {
         let client_for_reconciliation = Arc::clone(&client);
         let state_for_reconciliation = Arc::clone(&state);
         tasks.spawn(async move {
