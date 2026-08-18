@@ -83,7 +83,7 @@ pub async fn run_health_server(
         let client = Arc::clone(&client);
         let runtime = Arc::clone(&runtime);
         tokio::spawn(async move {
-            let mut buf = [0_u8; 8192];
+            let mut buf = [0_u8; 65536];
             let Ok(n) = socket.read(&mut buf).await else {
                 return;
             };
